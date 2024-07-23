@@ -155,6 +155,8 @@ class AudioToTextRecorder:
                  sample_rate: int = SAMPLE_RATE,
                  initial_prompt: Optional[Union[str, Iterable[int]]] = None,
                  suppress_tokens: Optional[List[int]] = [-1],
+
+                 on_speech_silence=None
                  ):
         """
         Initializes an audio recorder and  transcription
@@ -403,6 +405,8 @@ class AudioToTextRecorder:
         self.suppress_tokens = suppress_tokens
         self.use_wake_words = wake_words or wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}
 
+        self.on_speech_silence = on_speech_silence
+
         # Initialize the logging configuration with the specified level
         log_format = 'RealTimeSTT: %(name)s - %(levelname)s - %(message)s'
 
@@ -443,7 +447,7 @@ class AudioToTextRecorder:
         # Set device for model
         self.device = "cuda" if self.device == "cuda" and torch.cuda.is_available() else "cpu"
 
-        self.transcript_process = self._start_thread(
+        self.transcript_process = mp.Process(
             target=AudioToTextRecorder._transcription_worker,
             args=(
                 child_transcription_pipe,
@@ -459,6 +463,7 @@ class AudioToTextRecorder:
                 self.suppress_tokens
             )
         )
+        self.transcript_process.start()
 
         # Start audio data reading process
         if self.use_microphone.value:
@@ -467,7 +472,7 @@ class AudioToTextRecorder:
                          f" sample rate: {self.sample_rate}"
                          f" buffer size: {self.buffer_size}"
                          )
-            self.reader_process = self._start_thread(
+            self.reader_process = mp.Process(
                 target=AudioToTextRecorder._audio_data_worker,
                 args=(
                     self.audio_queue,
@@ -479,6 +484,7 @@ class AudioToTextRecorder:
                     self.use_microphone
                 )
             )
+            self.reader_process.start()
 
         # Initialize the realtime transcription model
         if self.enable_realtime_transcription:
@@ -502,7 +508,6 @@ class AudioToTextRecorder:
             logging.debug("Faster_whisper realtime speech to text "
                           "transcription model initialized successfully")
 
-        # Setup wake word detection
         if wake_words or wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}:
             self.wakeword_backend = wakeword_backend
 
@@ -515,8 +520,7 @@ class AudioToTextRecorder:
                 for _ in range(len(self.wake_words_list))
             ]
 
-            if self.wakeword_backend in {'pvp', 'pvporcupine'}:
-
+            if self.wakeword_backend in ['pvp', 'pvporcupine']:
                 try:
                     self.porcupine = pvporcupine.create(
                         keywords=self.wake_words_list,
@@ -536,8 +540,7 @@ class AudioToTextRecorder:
                     "Porcupine wake word detection engine initialized successfully"
                 )
 
-            elif self.wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}:
-                    
+            elif self.wakeword_backend in ['oww', 'openwakeword', 'openwakewords']:
                 openwakeword.utils.download_models()
 
                 try:
@@ -577,7 +580,6 @@ class AudioToTextRecorder:
                 logging.debug(
                     "Open wake word detection engine initialized successfully"
                 )
-            
             else:
                 logging.exception(f"Wakeword engine {self.wakeword_backend} unknown/unsupported. Please specify one of: pvporcupine, openwakeword.")
 
@@ -640,36 +642,13 @@ class AudioToTextRecorder:
         self.realtime_thread = threading.Thread(target=self._realtime_worker)
         self.realtime_thread.daemon = True
         self.realtime_thread.start()
-                   
+
         # Wait for transcription models to start
         logging.debug('Waiting for main transcription model to start')
         self.main_transcription_ready_event.wait()
         logging.debug('Main transcription model ready')
 
         logging.debug('RealtimeSTT initialization completed successfully')
-                   
-    def _start_thread(self, target=None, args=()):
-        """
-        Implement a consistent threading model across the library.
-
-        This method is used to start any thread in this library. It uses the
-        standard threading. Thread for Linux and for all others uses the pytorch
-        MultiProcessing library 'Process'.
-        Args:
-            target (callable object): is the callable object to be invoked by
-              the run() method. Defaults to None, meaning nothing is called.
-            args (tuple): is a list or tuple of arguments for the target
-              invocation. Defaults to ().
-        """
-        if (platform.system() == 'Linux'):
-            thread = threading.Thread(target=target, args=args)
-            thread.deamon = True
-            thread.start()
-            return thread
-        else:
-            thread = mp.Process(target=target, args=args)
-            thread.start()
-            return thread
 
     @staticmethod
     def _transcription_worker(conn,
@@ -967,27 +946,26 @@ class AudioToTextRecorder:
             logging.error(result)
             raise Exception(result)
 
-    def _process_wakeword(self, data):
+    def process_wakeword(self, data):
         """
         Processes audio data to detect wake words.
         """
-        if self.wakeword_backend in {'pvp', 'pvporcupine'}:
+        if self.wakeword_backend in ['pvp', 'pvporcupine']:
             pcm = struct.unpack_from(
                 "h" * self.buffer_size,
                 data
             )
             porcupine_index = self.porcupine.process(pcm)
             if self.debug_mode:
-                print (f"wake words porcupine_index: {porcupine_index}")
+                print(f"wake words porcupine_index: {porcupine_index}")
             return self.porcupine.process(pcm)
 
-        elif self.wakeword_backend in {'oww', 'openwakeword', 'openwakewords'}:
+        elif self.wakeword_backend in ['oww', 'openwakeword', 'openwakewords']:
             pcm = np.frombuffer(data, dtype=np.int16)
             prediction = self.owwModel.predict(pcm)
             max_score = -1
             max_index = -1
             wake_words_in_prediction = len(self.owwModel.prediction_buffer.keys())
-            self.wake_words_sensitivities
             if wake_words_in_prediction:
                 for idx, mdl in enumerate(self.owwModel.prediction_buffer.keys()):
                     scores = list(self.owwModel.prediction_buffer[mdl])
@@ -995,16 +973,17 @@ class AudioToTextRecorder:
                         max_score = scores[-1]
                         max_index = idx
                 if self.debug_mode:
-                    print (f"wake words oww max_index, max_score: {max_index} {max_score}")
+                    print(f"wake words oww max_index, max_score: {max_index} {max_score}")
                 return max_index  
             else:
                 if self.debug_mode:
-                    print (f"wake words oww_index: -1")
+                    print(f"wake words oww_index: -1")
                 return -1
 
-        if self.debug_mode:        
-            print("wake words no match")
-        return -1
+        else:
+            if self.debug_mode:        
+                print("wake words no match")
+            return -1
 
     def text(self,
              on_transcription_finished=None,
@@ -1366,6 +1345,8 @@ class AudioToTextRecorder:
                                 self.speech_end_silence_start > \
                                 self.post_speech_silence_duration:
                             logging.info("voice deactivity detected")
+                            self.on_pos
+                            self.on_speech_silence()
                             self.stop()
 
                 if not self.is_recording and was_recording:
